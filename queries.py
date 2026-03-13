@@ -190,6 +190,7 @@ def hybrid_search(query: str, db, top_k: int = 10, rerank: bool = True) -> list[
         confidence = round(normalized_score / 100.0, 3)
 
         result = {
+            "symbol_id": sid,
             **details[sid],
             "score": round(normalized_score, 1),
             "match_reason": match_reason,
@@ -400,6 +401,7 @@ def find_references(symbol_name: str, db, include_context: bool = True) -> list[
 
     # Enrich with context
     enriched = []
+    file_cache: dict[str, list[str] | None] = {}
     for r in rows:
         ref = {
             "symbol_name": r[0],
@@ -409,14 +411,18 @@ def find_references(symbol_name: str, db, include_context: bool = True) -> list[
             "containing_symbol": None,
         }
 
-        # Get the source line at this reference
-        try:
-            with open(r[1]) as f:
-                lines = f.readlines()
-                if 0 < r[2] <= len(lines):
-                    ref["source_line"] = lines[r[2] - 1].strip()
-        except Exception:
-            pass
+        # Get the source line at this reference (cached per file)
+        file_path = r[1]
+        if file_path not in file_cache:
+            try:
+                with open(file_path) as f:
+                    file_cache[file_path] = f.readlines()
+            except Exception:
+                file_cache[file_path] = None
+
+        cached_lines = file_cache[file_path]
+        if cached_lines and 0 < r[2] <= len(cached_lines):
+            ref["source_line"] = cached_lines[r[2] - 1].strip()
 
         # Find containing symbol
         containing = db.execute(

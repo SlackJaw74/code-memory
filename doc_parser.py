@@ -7,31 +7,20 @@ and indexes them for hybrid retrieval (BM25 + vector search).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
 from markdown_it import MarkdownIt
 
 import db as db_mod
-from parser import GitignoreMatcher
+from parser import SKIP_DIRS, GitignoreMatcher
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-SKIP_DIRS = {
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".git",
-    "node_modules",
-    "build",
-    "dist",
-    "target",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-}
 
 DOC_EXTENSIONS = {".md", ".markdown"}
 README_PATTERN = re.compile(r"^readme(\.md|\.markdown|\.txt)?$", re.IGNORECASE)
@@ -392,6 +381,20 @@ def index_doc_directory(dirpath: str, db, progress_callback=None, progress_offse
         if progress_callback:
             current = progress_offset + i + 1
             progress_callback(current, progress_total, f"Indexing docs: {os.path.basename(filepath)}")
+
+    # Clean up stale doc files (deleted from disk but still in index)
+    stale_count = 0
+    rows = db.execute("SELECT id, path FROM doc_files").fetchall()
+    for doc_file_id, path in rows:
+        if not path.startswith(abs_dir + os.sep) and path != abs_dir:
+            continue
+        if not os.path.exists(path):
+            db_mod.delete_doc_file_data(db, doc_file_id)
+            db.execute("DELETE FROM doc_files WHERE id = ?", (doc_file_id,))
+            db.commit()
+            stale_count += 1
+    if stale_count:
+        logger.info("Cleaned up %d stale doc file(s) no longer on disk", stale_count)
 
     return results
 

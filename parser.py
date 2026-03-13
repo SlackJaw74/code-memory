@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = int(os.environ.get("CODE_MEMORY_MAX_WORKERS", "4"))
 
 # ── Directories to always skip (even without .gitignore) ───────────────
-_SKIP_DIRS = frozenset({
+SKIP_DIRS = frozenset({
     ".venv", "venv", "__pycache__", ".git", "node_modules",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
     "dist", "build", "target", "bin", "obj",
@@ -331,122 +331,6 @@ def _extract_references(tree_root: Node, source: bytes) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Single-file indexer
-# ---------------------------------------------------------------------------
-
-def index_file(filepath: str, db) -> dict:
-    """Parse a single source file and index its symbols + references.
-
-    Optimized version using batch embeddings and transaction-based writes.
-
-    Uses tree-sitter when a grammar is available for the file's language.
-    Falls back to indexing the whole file as a single symbol otherwise.
-    Skips the file if its ``last_modified`` timestamp has not changed.
-
-    Args:
-        filepath: Absolute path to a source file.
-        db: An open ``sqlite3.Connection`` from ``db.get_db()``.
-
-    Returns:
-        A dict with ``file``, ``symbols_indexed``, ``references_indexed``,
-        and ``skipped`` keys.
-    """
-    filepath = os.path.abspath(filepath)
-    ext = os.path.splitext(filepath)[1].lower()
-
-    # ── Check freshness ───────────────────────────────────────────────
-    mtime = os.path.getmtime(filepath)
-    row = db.execute(
-        "SELECT id, last_modified FROM files WHERE path = ?", (filepath,)
-    ).fetchone()
-
-    if row and row[1] >= mtime:
-        return {"file": filepath, "symbols_indexed": 0,
-                "references_indexed": 0, "skipped": True}
-
-    # ── Read file ─────────────────────────────────────────────────────
-    source_bytes = Path(filepath).read_bytes()
-    source_text = source_bytes.decode("utf-8", errors="replace")
-
-    fhash = db_mod.file_hash(filepath)  # Now uses xxHash
-    file_id = db_mod.upsert_file(db, filepath, mtime, fhash)
-
-    # Delete stale data before re-inserting
-    db_mod.delete_file_data(db, file_id)
-
-    symbols_indexed = 0
-    references_indexed = 0
-
-    # ── Try tree-sitter parsing ───────────────────────────────────────
-    lang = _load_language(ext)
-
-    if lang is not None:
-        parser = Parser(lang)
-        tree = parser.parse(source_bytes)
-
-        # Extract symbols
-        raw_symbols = _extract_symbols(tree.root_node, source_bytes)
-
-        # === BATCH PROCESSING ===
-        all_embed_inputs = []
-        for sym in raw_symbols:
-            embed_input = f"{sym['kind']} {sym['name']}: {sym['source_text'][:1000]}"
-            all_embed_inputs.append(embed_input)
-
-        # Batch embed all at once
-        # Use code2code task_type for code content at index time.
-        # Query time uses nl2code (natural language -> code), so index time
-        # should use code2code (code -> code) to place vectors in the correct subspace.
-        if all_embed_inputs:
-            embeddings = db_mod.embed_texts_batch(all_embed_inputs, batch_size=64, task_type="code2code")
-
-            # Store all in single transaction
-            db_ids = {}
-            with db_mod.transaction(db):
-                for i, sym in enumerate(raw_symbols):
-                    parent_id = db_ids.get(sym["parent_idx"]) if sym["parent_idx"] is not None else None
-                    sym_id = db_mod.upsert_symbol(
-                        db, sym["name"], sym["kind"], file_id,
-                        sym["line_start"], sym["line_end"],
-                        parent_id, sym["source_text"],
-                        auto_commit=False
-                    )
-                    db_ids[i] = sym_id
-                    db_mod.upsert_embedding(db, sym_id, embeddings[i], auto_commit=False)
-                    symbols_indexed += 1
-
-        # Extract and store references (also batched)
-        refs = _extract_references(tree.root_node, source_bytes)
-        if refs:
-            with db_mod.transaction(db):
-                for ref in refs:
-                    db_mod.upsert_reference(db, ref["name"], file_id, ref["line"], auto_commit=False)
-                    references_indexed += 1
-
-    else:
-        # ── Fallback: index entire file as one symbol ─────────────────
-        basename = os.path.basename(filepath)
-        embeddings = db_mod.embed_texts_batch([f"file {basename}: {source_text[:1000]}"], task_type="code2code")
-
-        with db_mod.transaction(db):
-            sym_id = db_mod.upsert_symbol(
-                db, basename, "file", file_id,
-                1, source_text.count("\n") + 1,
-                None, source_text[:5000],
-                auto_commit=False
-            )
-            db_mod.upsert_embedding(db, sym_id, embeddings[0], auto_commit=False)
-            symbols_indexed += 1
-
-    return {
-        "file": filepath,
-        "symbols_indexed": symbols_indexed,
-        "references_indexed": references_indexed,
-        "skipped": False,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Directory indexer
 # ---------------------------------------------------------------------------
 
@@ -457,7 +341,7 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
     embedding generation sequential (sentence-transformers releases GIL during
     inference). Processes files in batches for embedding efficiency.
 
-    Skips directories in ``_SKIP_DIRS``, files matching ``.gitignore`` patterns
+    Skips directories in ``SKIP_DIRS``, files matching ``.gitignore`` patterns
     (including nested .gitignore files), and unchanged files.  Indexes any file
     with a recognised source-code extension.
 
@@ -467,7 +351,8 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
         progress_callback: Optional callback(current, total, message) for progress updates.
 
     Returns:
-        A list of per-file result dicts (see :func:`index_file`).
+        A list of per-file result dicts (see :func:`_parse_file_for_indexing`
+        and :func:`_store_parsed_file`).
     """
     import time
 
@@ -486,7 +371,7 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
         rel_root = os.path.relpath(root, dirpath)
         if rel_root != ".":
             gitignore.check_dir_for_gitignore(root, rel_root)
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.endswith(".egg-info")
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.endswith(".egg-info")
                    and not gitignore.should_skip(os.path.join(rel_root, d) if rel_root != "." else d, is_dir=True)]
         for fname in sorted(files):
             rel_path = os.path.join(rel_root, fname) if rel_root != "." else fname
@@ -592,6 +477,20 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
         file_embeddings = file_to_embeddings.get(fpath)
         file_result = _store_parsed_file(fpath, parsed_data, db, file_embeddings)
         results.append(file_result)
+
+    # Phase 4: Clean up stale files (deleted from disk but still in index)
+    stale_count = 0
+    rows = db.execute("SELECT id, path FROM files").fetchall()
+    for file_id, path in rows:
+        if not path.startswith(dirpath + os.sep) and path != dirpath:
+            continue
+        if not os.path.exists(path):
+            db_mod.delete_file_data(db, file_id)
+            db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            db.commit()
+            stale_count += 1
+    if stale_count:
+        logger.info("Cleaned up %d stale file(s) no longer on disk", stale_count)
 
     # Log performance summary
     total_elapsed = time.perf_counter() - total_start

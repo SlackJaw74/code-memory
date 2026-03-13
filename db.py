@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import sqlite_vec
@@ -150,19 +151,26 @@ def get_embedding_dim() -> int:
     return _embedding_dim
 
 
+@lru_cache(maxsize=128)
+def _embed_text_cached(text: str, task_type: str) -> tuple[float, ...]:
+    """Cached embedding computation. Returns tuple for hashability."""
+    model = get_embedding_model()
+    prefixed_text = f"{task_type}: {text}"
+    vec = model.encode(prefixed_text, normalize_embeddings=True, show_progress_bar=False)
+    return tuple(vec.tolist())
+
+
 def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
     """Generate a dense vector embedding for *text*.
 
     Uses jina-code-embeddings with task prefix for better code retrieval.
+    Results are cached (LRU, 128 entries) to avoid redundant model calls.
 
     Args:
         text: The text to embed.
         task_type: One of 'nl2code', 'code2code', 'code2nl', 'code2completion', 'qa'.
     """
-    model = get_embedding_model()
-    prefixed_text = f"{task_type}: {text}"
-    vec = model.encode(prefixed_text, normalize_embeddings=True, show_progress_bar=False)
-    return vec.tolist()
+    return list(_embed_text_cached(text, task_type))
 
 
 def embed_texts_batch(
