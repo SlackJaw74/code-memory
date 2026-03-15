@@ -308,20 +308,28 @@ def index_doc_file(
     if embed_inputs:
         embeddings = db_mod.embed_texts_batch(embed_inputs, task_type="nl2code")
 
+        embedding_pairs: list[tuple[int, list[float]]] = []
         with db_mod.transaction(db):
             for i, chunk in enumerate(chunks_to_store):
-                chunk_id = db_mod.upsert_doc_chunk(
-                    db,
-                    doc_file_id,
-                    i,  # chunk_index
-                    chunk["section_title"],
-                    chunk["content"],
-                    chunk["line_start"],
-                    chunk["line_end"],
-                    auto_commit=False,
+                cursor = db.execute(
+                    """INSERT INTO doc_chunks
+                           (doc_file_id, chunk_index, section_title,
+                            content, line_start, line_end)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(doc_file_id, chunk_index) DO UPDATE SET
+                           section_title = excluded.section_title,
+                           content       = excluded.content,
+                           line_start    = excluded.line_start,
+                           line_end      = excluded.line_end""",
+                    (doc_file_id, i, chunk["section_title"],
+                     chunk["content"], chunk["line_start"], chunk["line_end"]),
                 )
-                db_mod.upsert_doc_embedding(db, chunk_id, embeddings[i], auto_commit=False)
+                chunk_id = cursor.lastrowid
+                embedding_pairs.append((chunk_id, embeddings[i]))
                 chunks_indexed += 1
+
+            # Batch-insert all doc embeddings at once
+            db_mod.batch_insert_doc_embeddings(db, embedding_pairs)
 
     return {
         "file": filepath,

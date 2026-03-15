@@ -506,6 +506,10 @@ def get_db(project_dir: str) -> sqlite3.Connection:
 
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA synchronous=NORMAL")    # Safe with WAL; halves fsync overhead
+    db.execute("PRAGMA cache_size=-64000")      # 64 MB page cache
+    db.execute("PRAGMA temp_store=MEMORY")      # Temp tables in RAM
+    db.execute("PRAGMA mmap_size=268435456")    # 256 MB memory-mapped I/O
 
     db.executescript(_SCHEMA_SQL)
 
@@ -739,6 +743,48 @@ def upsert_embedding(
     )
     if auto_commit:
         db.commit()
+
+
+def batch_insert_embeddings(
+    db: sqlite3.Connection,
+    pairs: list[tuple[int, list[float]]],
+) -> None:
+    """Insert multiple symbol embeddings in one executemany call.
+
+    Assumes stale embeddings for these symbols have already been deleted
+    (e.g. via delete_file_data).  Caller must manage the transaction.
+    """
+    import struct
+
+    if not pairs:
+        return
+    dim = len(pairs[0][1])
+    rows = [(sid, struct.pack(f"{dim}f", *emb)) for sid, emb in pairs]
+    db.executemany(
+        "INSERT INTO symbol_embeddings (symbol_id, embedding) VALUES (?, ?)",
+        rows,
+    )
+
+
+def batch_insert_doc_embeddings(
+    db: sqlite3.Connection,
+    pairs: list[tuple[int, list[float]]],
+) -> None:
+    """Insert multiple doc embeddings in one executemany call.
+
+    Assumes stale embeddings have already been deleted.
+    Caller must manage the transaction.
+    """
+    import struct
+
+    if not pairs:
+        return
+    dim = len(pairs[0][1])
+    rows = [(cid, struct.pack(f"{dim}f", *emb)) for cid, emb in pairs]
+    db.executemany(
+        "INSERT INTO doc_embeddings (chunk_id, embedding) VALUES (?, ?)",
+        rows,
+    )
 
 
 # ---------------------------------------------------------------------------

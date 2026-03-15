@@ -581,41 +581,64 @@ def _store_parsed_file(
     db,
     file_embeddings: list | None
 ) -> dict:
-    """Store parsed file data to database with pre-computed embeddings."""
+    """Store parsed file data to database with pre-computed embeddings.
+
+    Uses a single transaction for all writes and batch inserts for
+    embeddings and references to minimise SQLite round-trips.
+    """
     filepath = os.path.abspath(filepath)
-
-    # Upsert file record
-    file_id = db_mod.upsert_file(db, filepath, parsed_data["mtime"], parsed_data["fhash"])
-
-    # Delete stale data
-    db_mod.delete_file_data(db, file_id)
 
     symbols_indexed = 0
     references_indexed = 0
 
-    # Store symbols with embeddings
-    if parsed_data.get("symbols") and file_embeddings:
-        db_ids = {}
-        with db_mod.transaction(db):
+    with db_mod.transaction(db):
+        # Upsert file record (inside the transaction)
+        file_id = db_mod.upsert_file(
+            db, filepath, parsed_data["mtime"], parsed_data["fhash"],
+            auto_commit=False,
+        )
+
+        # Delete stale data
+        db_mod.delete_file_data(db, file_id, auto_commit=False)
+
+        # Store symbols — data was just deleted so every insert is fresh;
+        # use cursor.lastrowid instead of a separate SELECT.
+        embedding_pairs: list[tuple[int, list[float]]] = []
+
+        if parsed_data.get("symbols"):
+            db_ids: dict[int, int] = {}
             for i, sym in enumerate(parsed_data["symbols"]):
                 parent_id = db_ids.get(sym["parent_idx"]) if sym["parent_idx"] is not None else None
-                sym_id = db_mod.upsert_symbol(
-                    db, sym["name"], sym["kind"], file_id,
-                    sym["line_start"], sym["line_end"],
-                    parent_id, sym["source_text"],
-                    auto_commit=False
+                cursor = db.execute(
+                    """INSERT INTO symbols
+                           (name, kind, file_id, line_start, line_end,
+                            parent_symbol_id, source_text)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (sym["name"], sym["kind"], file_id,
+                     sym["line_start"], sym["line_end"],
+                     parent_id, sym["source_text"]),
                 )
+                sym_id = cursor.lastrowid
                 db_ids[i] = sym_id
-                if i < len(file_embeddings):
-                    db_mod.upsert_embedding(db, sym_id, file_embeddings[i], auto_commit=False)
+
+                if file_embeddings and i < len(file_embeddings):
+                    embedding_pairs.append((sym_id, file_embeddings[i]))
                 symbols_indexed += 1
 
-    # Store references
-    if parsed_data.get("references"):
-        with db_mod.transaction(db):
-            for ref in parsed_data["references"]:
-                db_mod.upsert_reference(db, ref["name"], file_id, ref["line"], auto_commit=False)
-                references_indexed += 1
+        # Batch-insert all embeddings in one executemany call
+        if embedding_pairs:
+            db_mod.batch_insert_embeddings(db, embedding_pairs)
+
+        # Batch-insert references via executemany
+        refs = parsed_data.get("references")
+        if refs:
+            db.executemany(
+                """INSERT OR IGNORE INTO references_
+                       (symbol_name, file_id, line_number)
+                   VALUES (?, ?, ?)""",
+                [(ref["name"], file_id, ref["line"]) for ref in refs],
+            )
+            references_indexed = len(refs)
 
     return {
         "file": filepath,
