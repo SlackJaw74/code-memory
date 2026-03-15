@@ -42,6 +42,10 @@ EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
 # Options: 'cuda', 'mps', 'cpu', or 'auto' (default)
 CODE_MEMORY_DEVICE = os.environ.get("CODE_MEMORY_DEVICE", "auto")
 
+# Embedding batch size - controls how many texts are embedded at once
+# Larger batches = faster throughput but more memory usage
+CODE_MEMORY_BATCH_SIZE = int(os.environ.get("CODE_MEMORY_BATCH_SIZE", "64"))
+
 # Cross-encoder reranking - enabled by default for improved precision
 # Set CODE_MEMORY_RERANK=false to disable if latency is a concern
 CODE_MEMORY_RERANK = os.environ.get("CODE_MEMORY_RERANK", "false").lower() in ("true", "1", "yes")
@@ -174,7 +178,7 @@ def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
 
 
 def embed_texts_batch(
-    texts: list[str], batch_size: int = 32, task_type: str = "nl2code"
+    texts: list[str], batch_size: int | None = None, task_type: str = "nl2code"
 ) -> list[list[float]]:
     """Generate embeddings for multiple texts at once.
 
@@ -183,7 +187,8 @@ def embed_texts_batch(
 
     Args:
         texts: List of text strings to embed.
-        batch_size: Number of texts to process per batch (default 32).
+        batch_size: Number of texts to process per batch.
+                    Defaults to CODE_MEMORY_BATCH_SIZE env var (default 64).
         task_type: One of 'nl2code', 'code2code', 'code2nl', 'code2completion', 'qa'.
 
     Returns:
@@ -191,6 +196,9 @@ def embed_texts_batch(
     """
     if not texts:
         return []
+
+    if batch_size is None:
+        batch_size = CODE_MEMORY_BATCH_SIZE
 
     model = get_embedding_model()
 

@@ -306,7 +306,7 @@ def index_doc_file(
     # they are retrievable by natural language queries.
     chunks_indexed = 0
     if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="nl2code")
+        embeddings = db_mod.embed_texts_batch(embed_inputs, task_type="nl2code")
 
         with db_mod.transaction(db):
             for i, chunk in enumerate(chunks_to_store):
@@ -460,7 +460,7 @@ def extract_docstrings_from_code(db) -> list[dict]:
     # Batch embed all docstrings.
     # Docstrings are extracted from code so use code2code for proper subspace placement.
     if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="code2code")
+        embeddings = db_mod.embed_texts_batch(embed_inputs, task_type="code2code")
 
         with db_mod.transaction(db):
             for i, doc_info in enumerate(docstrings_to_store):

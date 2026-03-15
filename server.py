@@ -394,7 +394,8 @@ async def index_codebase(directory: str, ctx: Context, cpu: bool = False) -> api
         directory: The root directory to index. Must be a valid path.
         cpu: If True, force CPU-only mode for embedding generation.
              Use this when GPU memory is unavailable or constrained (CUDA OOM).
-             Default is False (auto-detect and use GPU if available).
+             Default is False (auto-detect best device: CUDA > MPS > CPU).
+             Set CODE_MEMORY_DEVICE env var to override ('cuda', 'mps', 'cpu', or 'auto').
 
     Returns:
         Summary with files_indexed, total_symbols, total_chunks, and details.
